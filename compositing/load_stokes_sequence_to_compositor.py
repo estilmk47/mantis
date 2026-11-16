@@ -1,11 +1,11 @@
-# IMAGE_FOLDER_DATE = '2026-08-20'
-IMAGE_FOLDER_TIME = '16-35-09'
+IMAGE_FOLDER = '2026-09-09_11-32-14_images'
+CAM_FODLER = "cam0"
+SUFFIX = "jpg"
 
-RELATIVE_PATH_FROM_ROOT = f"../parser/output/{IMAGE_FOLDER_TIME}_images/cam0/oriented_intensities/"
-INTESITY_AT_ANGLES = ('i000', 'i045', 'i090', 'i135')
+RELATIVE_PATH_FROM_ROOT = f"../parser/output/{IMAGE_FOLDER}/{CAM_FODLER}/partial_stokes_vector/"
 
-
-IMAGE_SEQUENCE_NODES = ('i000_seq', 'i045_seq', 'i090_seq', 'i135_seq')
+STOKES_COMPONENTS = ('s0', 's1', 's2')
+IMAGE_SEQUENCE_NODES = ('S0 - seq', 'S1 - seq', 'S2 - seq')
 
 # Scene frame the first file of every sequence is shown on.
 SEQUENCE_START_FRAME = 1
@@ -38,9 +38,9 @@ def compositor_node_tree(scene):
 
 def sequence_frames(folder):
     """The zero-padded .png files in *folder*, in playback order."""
-    frames = sorted(name for name in os.listdir(folder) if name.lower().endswith(".png"))
+    frames = sorted(name for name in os.listdir(folder) if name.lower().endswith(f".{SUFFIX}"))
     if not frames:
-        raise RuntimeError(f"No .png frames found in {folder}")
+        raise RuntimeError(f"No .{SUFFIX} frames found in {folder}")
     return frames
 
 
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     sequence_root = relative_to_abs_path(RELATIVE_PATH_FROM_ROOT)
 
     longest_sequence = 0
-    for angle, node_name in zip(INTESITY_AT_ANGLES, IMAGE_SEQUENCE_NODES):
+    for angle, node_name in zip(STOKES_COMPONENTS, IMAGE_SEQUENCE_NODES):
         folder = os.path.join(sequence_root, angle)
         frames = sequence_frames(folder)
         node = find_sequence_node(tree, node_name, angle)
@@ -109,4 +109,4 @@ if __name__ == "__main__":
 
     # Nudge the compositor so it re-evaluates with the new sequences.
     scene.frame_set(scene.frame_current)
-    print(f"Loaded {len(INTESITY_AT_ANGLES)} sequences from {sequence_root}")
+    print(f"Loaded {len(STOKES_COMPONENTS)} sequences from {sequence_root}")
