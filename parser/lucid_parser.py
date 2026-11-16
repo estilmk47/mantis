@@ -4,6 +4,7 @@ import os
 import cv2
 import numpy as np
 
+from typing import Literal
 
 # The sensor carries a polarizer mosaic on top of a Bayer mosaic (the layout of
 # Sony's Polarsens parts, e.g. IMX250MYR; measured from the raw data rather than
@@ -78,36 +79,76 @@ def _to_gray(rgb: np.ndarray) -> np.ndarray:
     """Luma of an RGB array. Works for the signed S1/S2 planes as well."""
     return rgb @ LUMA_RGB
 
+# def _write_rgb(directory: str, filename: str, image: np.ndarray) -> None:
+#     """
+#     Write an RGB (or single channel) float array as a 16 bit image. Values are
+#     expected to already be on the 0..65535 scale; they are clipped and rounded.
+#     """
+#     os.makedirs(directory, exist_ok=True)
+#     path = os.path.join(directory, filename)
 
-def _write_rgb(directory: str, filename: str, image: np.ndarray) -> None:
+#     image = np.clip(image, 0, 65535).astype(np.uint16)
+#     if image.ndim == 3:
+#         image = image[..., ::-1]  # RGB -> BGR for OpenCV
+#     if not cv2.imwrite(path, np.ascontiguousarray(image)):
+#         raise IOError(f"cv2.imwrite failed for {path}")
+
+
+ValueRange = Literal[1, 255, 65535]
+
+
+def _write_rgb(
+    directory: str,
+    filename: str,
+    image: np.ndarray,
+    value_range: ValueRange = 65535,
+    jpeg_quality: int = 95,
+) -> None:
     """
-    Write an RGB (or single channel) float array as a 16 bit image. Values are
-    expected to already be on the 0..65535 scale; they are clipped and rounded.
+    Write an RGB (or single channel) array to disk.
+
+    value_range describes the scale the input values are on:
+      65535 -> written as 16 bit PNG (filename must end in .png)
+      255   -> written as 8 bit PNG or JPEG
+      1     -> scaled to 0..255, written as 8 bit PNG or JPEG
+
+    Values are clipped to the range and rounded to the nearest integer.
+    The output format is taken from the filename extension.
     """
+    if value_range not in (1, 255, 65535):
+        raise ValueError(f"value_range must be 1, 255 or 65535, got {value_range}")
+
+    ext = os.path.splitext(filename)[1].lower()
+    image = np.asarray(image, dtype=np.float64)
+
+    if value_range == 65535:
+        if ext != ".png":
+            raise ValueError("value_range=65535 is written as 16 bit PNG; use a .png filename")
+        out = np.clip(np.rint(image), 0, 65535).astype(np.uint16)
+        params = [cv2.IMWRITE_PNG_COMPRESSION, 9]
+    else:
+        if ext not in (".png", ".jpg", ".jpeg"):
+            raise ValueError(f"value_range={value_range} supports .png or .jpg/.jpeg, got '{ext}'")
+        scaled = image * (255.0 / value_range)
+        out = np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
+        if ext == ".png":
+            params = [cv2.IMWRITE_PNG_COMPRESSION, 9]
+        else:
+            params = [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)]
+
+    if out.ndim == 3 and out.shape[2] == 3:
+        out = out[..., ::-1]  # RGB -> BGR for OpenCV
+
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
-
-    image = np.clip(image, 0, 65535).astype(np.uint16)
-    if image.ndim == 3:
-        image = image[..., ::-1]  # RGB -> BGR for OpenCV
-    if not cv2.imwrite(path, np.ascontiguousarray(image)):
+    if not cv2.imwrite(path, np.ascontiguousarray(out), params):
         raise IOError(f"cv2.imwrite failed for {path}")
 
 
 def convert_raw(
     input_path: str, 
     output_path: str, 
-    output_suffix: str = "png", 
-
-    oriented_intesities: bool = False,
-
-    color_formating: str = "s1", # Choose between 'max_pool', 'average' and 's1'
-    color: bool = True,
-
-    aolp_encoding: str = "sine_and_cosine", # Choose between 'sine_and_cosine' and 'normalized'
-    aolp_dolp: bool = True, 
-
-    partial_stokes_vector: bool = False
+    output_suffix: str = "png"
 ):
     """
     Processes the raw data and saves them as images. This includes as allways the color channels,
@@ -124,21 +165,6 @@ def convert_raw(
     (png or tif; jpg will silently be reduced to 8 bit). The output layout is
 
         {output_path}/{cam}/oriented_intensities/{i000,i045,i090,i135}/
-        {output_path}/{cam}/color/
-        {output_path}/{cam}/partial_stokes_vector/
-        {output_path}/{cam}/aolp_dolp/
-
-    and the encodings, all of them exactly invertible, are
-
-        oriented intensities, color   value  = adu * 16,            adu in [0, 4095]
-        stokes S0                     value  = S0 * 8,              S0  in [0, 8190]
-        stokes S1, S2                 value  = (S + 4096) * 8,      S   in [-4095, 4095]
-        dolp                          value  = dolp * 65535,        dolp in [0, 1]
-        aolp sine/cosine              value  = (t + 1) / 2 * 65535, t   in [-1, 1]
-        aolp normalized               value  = (aolp / pi + 0.5) * 65535
-
-    No white balance is applied; the raw ADUs are kept as captured. The per frame
-    balance_ratio from the sidecar .json can be applied afterwards if wanted.
     """
 
     RES = (2448, 2048)
@@ -146,19 +172,20 @@ def convert_raw(
 
     suffix = output_suffix.lstrip(".")
 
-    if color_formating not in ("s1", "max_pool", "average"):
-        raise ValueError(f"Unknown color_formating {color_formating!r}")
-    # The default value spells it "normalized", the branch below spelled it
-    # "normalize"; accept both.
-    if aolp_encoding not in ("sine_and_cosine", "normalized", "normalize"):
-        raise ValueError(f"Unknown aolp_encoding {aolp_encoding!r}")
-
-    # Loop through all the raw files in the input folder
-    # The raw files contains two images of equal size of 2448 x 2048 resolution
-    # Unravel these binaries into two variables cam0 (left) and cam1 (right)
-    raw_paths = sorted(glob.glob(os.path.join(input_path, "*.raw")))
-    if not raw_paths:
-        raise FileNotFoundError(f"No .raw files found in {input_path}")
+    # Collect the raw files to process.
+    # input_path may be either a single .raw file or a folder containing .raw files.
+    # Each raw file contains two images of equal size (2448 x 2048),
+    # which are unravelled into cam0 (left) and cam1 (right).
+    if os.path.isfile(input_path):
+        if not input_path.lower().endswith(".raw"):
+            raise ValueError(f"Input file is not a .raw file: {input_path}")
+        raw_paths = [input_path]
+    elif os.path.isdir(input_path):
+        raw_paths = sorted(glob.glob(os.path.join(input_path, "*.raw")))
+        if not raw_paths:
+            raise FileNotFoundError(f"No .raw files found in {input_path}")
+    else:
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     frame_bytes = (res_x * res_y * 3) // 2
 
@@ -202,97 +229,23 @@ def convert_raw(
             # and debayer each of the four (rggb) images
             # (res_y/2, res_x/2, channels[1]=rggb) -> (res_y/2, res_x/2, channels[3]=rgb)
             oriented = _split_orientations(cam)
-            i000, i045, i090, i135 = (
-                oriented["i000"], oriented["i045"], oriented["i090"], oriented["i135"]
-            )
-
-            if oriented_intesities:
-                for orientation, image in oriented.items():
-                    _write_rgb(
-                        os.path.join(cam_out, "oriented_intensities", orientation),
-                        out_name,
-                        image * U16_PER_ADU,
-                    )
-
-            if not (color or partial_stokes_vector or aolp_dolp):
-                continue
-
-            # Get partial stokes vector
-            S0 = i000 + i090
-            S1 = i000 - i090
-            S2 = i045 - i135
-
-            if color:
-                if color_formating == "s1":
-                    # S0 is the total intensity of the i000/i090 pair, so half of
-                    # it is on the same scale as a single orientation. TODO: consider not halfing it as the polarization filters do block light as well
-                    color_image = S0 / 2
-                elif color_formating == "max_pool":
-                    # max select the maximum pixel value for each color channel selected from the four orientations i000, i045, i090, i135
-                    color_image = np.maximum(np.maximum(i000, i045), np.maximum(i090, i135))
-                elif color_formating == "average":
-                    # average the pixel value for each coolor channel selected from the four orientations i000, i045, i090, i135
-                    color_image = (i000 + i045 + i090 + i135) / 4
-
-                _write_rgb(os.path.join(cam_out, "color"), out_name, color_image * U16_PER_ADU)
-
-            if not (aolp_dolp or partial_stokes_vector):
-                continue
-
-            # Convert S0, S1, S2 from rgb to grayscale
-            S0 = _to_gray(S0)
-            S1 = _to_gray(S1)
-            S2 = _to_gray(S2)
-
-            if partial_stokes_vector:
-                # save the s0 in the first color channel, etc...
-                stokes_image = np.stack(
-                    [
-                        S0 * 8,
-                        (S1 + (MAX_12BIT + 1)) * 8,
-                        (S2 + (MAX_12BIT + 1)) * 8,
-                    ],
-                    axis=-1,
+            # i000, i045, i090, i135 = (
+            #     oriented["i000"], oriented["i045"], oriented["i090"], oriented["i135"]
+            # )
+            for orientation, image in oriented.items():
+                _write_rgb(
+                    os.path.join(cam_out, "oriented_intensities", orientation),
+                    out_name,
+                    image * U16_PER_ADU,
                 )
-                _write_rgb(os.path.join(cam_out, "partial_stokes_vector"), out_name, stokes_image)
-
-            if not aolp_dolp:
-                continue
-
-            with np.errstate(divide="ignore", invalid="ignore"):
-                dolp = np.sqrt(S1 ** 2 + S2 ** 2) / S0
-            dolp = np.clip(np.nan_to_num(dolp, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 1.0)
-            aolp = np.arctan2(S2, S1) / 2  # in [-pi/2, pi/2]
-
-            if aolp_encoding == "sine_and_cosine":
-                # aolp is pi periodic, so sin/cos of twice the angle is the
-                # continuous encoding: no wrap around discontinuity to learn
-                aolp_r = (np.sin(2 * aolp) + 1) / 2
-                aolp_g = (np.cos(2 * aolp) + 1) / 2
-            else:
-                aolp_r = aolp / np.pi + 0.5
-                # aolp only has one channel here, so make the green channel 0
-                aolp_g = np.zeros_like(aolp)
-
-            # stack aolp and dolp channels
-            aolp_dolp_image = np.stack([aolp_r, aolp_g, dolp], axis=-1) * 65535
-
-            _write_rgb(os.path.join(cam_out, "aolp_dolp"), out_name, aolp_dolp_image)
 
         print(f"{raw_path} -> {out_name}")
-
-
-
 
 
 if __name__ == "__main__":
     # Recomended output: oriented_intensities
     # 10-17-29_images
     convert_raw(
-        input_path='../datasets/2026-09-07/10-17-29_images',
-        output_path='./output/2026-09-07_10-17-29_images',
-        oriented_intesities=True,
-        partial_stokes_vector=False,
-        color=False,
-        aolp_dolp=False,
+        input_path='./input/2026-08-15/08-38-33_images',
+        output_path='./output/2026-08-15_08-38-33_images'
     )

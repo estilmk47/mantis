@@ -1,0 +1,12 @@
+/parser/input/
+/parser/output/
+
+/compositing/output/
+/compositing/thumbnails/
+/compositing/make_thumbnails.py
+
+*.blend1
+
+*venv/
+*.venv/
+*__pycache__/
